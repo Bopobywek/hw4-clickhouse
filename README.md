@@ -3,6 +3,8 @@
 
 ## Окружение и запуск
 
+listening_events.csv.gz был загружен и расположен по пути ./stand/data
+
 ```
 SELECT version();
 
@@ -14,6 +16,13 @@ FROM takt.listening_events;
 events      first_event         last_event
 10000000	2026-10-13 00:00:49	2026-10-26 23:59:59
 ```
+
+Порядок запуска SQL:
+1. Подготовка стенда: `stand/compose.yaml` (docker compose up -d --wait) + загрузка данных (`00_prepare_source.sql`)
+2. `01_report.sql`
+3. `02_order_by.sql`
+4. `03_codecs.sql`
+5. `04_mv.sql`
 
 ## 1. Аналитический отчёт
 
@@ -272,7 +281,7 @@ SETTINGS index_granularity = 8192, index_granularity_bytes = 0
 
 ![](static/3_1_1_verfiy.png)  
 
-![](static/3_1_2_verfiy.png)
+![](static/3_1_2_verify.png)
 
 ### 3.2 Исследование соседних значений
 
@@ -287,6 +296,9 @@ SETTINGS index_granularity = 8192, index_granularity_bytes = 0
 | 5 | 486310 | 2026-10-25 15:05:10 | 486310 |
 | 6 | 296535 | 2026-10-23 10:22:15 | 296535 |
 
+
+![](static/3_2_1_result.png)
+
 **hw_codec_ordered**:
 
 | № | event_no | t_zstd | seconds_from_start |
@@ -297,6 +309,8 @@ SETTINGS index_granularity = 8192, index_granularity_bytes = 0
 | 4 | 3 | 2026-10-20 00:00:03 | 3 |
 | 5 | 4 | 2026-10-20 00:00:04 | 4 |
 | 6 | 5 | 2026-10-20 00:00:05 | 5 |
+
+![](static/3_2_2_result.png)
 
 **Таблица разностей hw_codec_mixed**
 | № | seconds_from_start | 1-я разность | 2-я разность |
@@ -347,6 +361,8 @@ a3 = a2 + d2 = 222135 + 258561 = 480696
 | 4 | hw_codec_ordered | t_delta | 2000000 | 2234 | 895.26 |
 | 5 | hw_codec_ordered | t_double_delta | 2000000 | 2325 | 860.22 |
 | 6 | hw_codec_ordered | t_zstd | 2000000 | 1332284 | 1.5 |
+
+![](static/3_3_1_result.png)
 
 
 ### 3.4 Ответы на вопросы  
@@ -402,3 +418,317 @@ ZSTD уже смотрит на значения как на последова�
 > Что изменится, если вместо времён событий сохранить только количества за каждый день?   
 
 Мы потеряем возможность смотреть данные не за целый день, а за промежуток, например, с середины одного дня по середину другого. То есть мы теряем возможность анализа данных на промежутках, не кратных суткам.  
+
+
+## 4. Материализованное представление  
+### 4.1 Создание таблицы, представления и проверка  
+
+### Проверка создания таблицы
+![](static/4_1_1_verify.png)
+
+#### 4.1.2 Создание представления
+
+```
+CREATE MATERIALIZED VIEW takt.hw_country_hourly_mv
+TO takt.hw_country_hourly
+AS
+SELECT
+    toStartOfHour(ended_at) AS hour,
+    country,
+    count() AS events,
+    countIf(played_seconds < 20) AS events_under_20,
+    sum(played_seconds) AS total_seconds
+FROM takt.hw_mv_events
+GROUP BY hour, country;
+```
+
+При выполнении селекта результат ожидаемо 0:  
+![](static/4_2_1_result.png)
+
+
+### 4.2 Результаты общего контроля
+
+#### Заполнение итогов по истории
+```
+INSERT INTO takt.hw_country_hourly
+SELECT
+    toStartOfHour(ended_at) AS hour,
+    country,
+    count() AS events,
+    countIf(played_seconds < 20) AS events_under_20,
+    sum(played_seconds) AS total_seconds
+FROM takt.hw_mv_events
+GROUP BY hour, country;
+```
+
+#### После заполнения истории
+
+```
+SELECT
+    hour,
+    country,
+    sum(events_delta) AS events_diff,
+    sum(short_delta) AS short_diff,
+    sum(seconds_delta) AS seconds_diff
+FROM
+(
+    SELECT
+        toStartOfHour(ended_at) AS hour,
+        country,
+        toInt64(count()) AS events_delta,
+        toInt64(countIf(played_seconds < 20)) AS short_delta,
+        toInt64(sum(played_seconds)) AS seconds_delta
+    FROM takt.hw_mv_events
+    GROUP BY hour, country
+    UNION ALL
+    SELECT
+        hour,
+        country,
+        -toInt64(events),
+        -toInt64(events_under_20),
+        -toInt64(total_seconds)
+    FROM takt.hw_country_hourly
+)
+GROUP BY hour, country
+HAVING events_diff != 0
+    OR short_diff != 0
+    OR seconds_diff != 0
+ORDER BY hour, country;
+```
+
+![](static/4_3_1_verify.png)
+
+#### После А  
+
+![](static/4_3_1_2_verify.png)
+
+#### После Б
+
+![](static/4_4_5_verify.png)    
+
+
+
+
+### 4.3 Ручные ожидаемые и фактические небольшие отчёты после А и Б
+
+#### Запрос отчета по итогам
+
+```
+SELECT
+    hour,
+    country,
+    sum(events) AS events_sum,
+    sum(events_under_20) AS short_count,
+    sum(total_seconds) AS seconds_sum,
+    round(100 * short_count / events_sum, 2) AS under_20_percent,
+    round(seconds_sum / events_sum, 2) AS seconds_avg
+FROM takt.hw_country_hourly
+WHERE hour >= toDateTime('2026-10-27 19:00:00', 'UTC')
+  AND hour < toDateTime('2026-10-27 21:00:00', 'UTC')
+GROUP BY hour, country
+ORDER BY hour, country;
+```
+
+#### Порция А
+
+**Расчет вручную**
+
+```
+INSERT INTO takt.hw_mv_events
+    (ended_at, country, played_seconds)
+VALUES
+    ('2026-10-27 19:01:00', 'RU', 5),
+    ('2026-10-27 19:02:00', 'RU', 19),
+    ('2026-10-27 19:03:00', 'RU', 20),
+    ('2026-10-27 19:04:00', 'RU', 40),
+    ('2026-10-27 19:05:00', 'KZ', 25);
+```
+
+**Ожидаемый результат**  
+hour=2026-10-27 19:00:00 (начало часа)  
+country=KZ  
+events_sum=1  
+short_count=0  
+seconds_sum=25  
+under_20_percent=0  
+seconds_avg=25  
+
+hour=2026-10-27 19:00:00  
+country=RU  
+events_sum=4  
+short_count=2  
+seconds_sum=84  
+under_20_percent=100*(2/4)=50  
+seconds_avg=(84/4)=21  
+
+**Реальный результат**  
+![](static/4_4_1_result.png)
+
+**Совпадает**, расхождений нет
+
+#### Порция Б
+
+```
+INSERT INTO takt.hw_mv_events
+    (ended_at, country, played_seconds)
+VALUES
+    ('2026-10-27 19:00:00', 'RU', 1),
+    ('2026-10-27 20:00:00', 'RU', 10),
+    ('2026-10-24 12:34:00', 'RU', 7);
+```
+
+**Ожидаемый результат**
+
+Для запроса 
+```
+WHERE hour = toDateTime('2026-10-24 12:00:00', 'UTC')
+  AND country = 'RU'
+```
+
+hour=2026-10-24 12:00:00  
+events_sum=26479 (+1)  
+short_count=6656 (+1)  
+seconds_sum=3659191 (+7)  
+under_20_percent=100 * 6656 / 26479=25.14  
+seconds_avg=3659191/26479=138.19  
+
+Для запроса  
+```
+WHERE hour >= toDateTime('2026-10-27 19:00:00', 'UTC')
+  AND hour < toDateTime('2026-10-27 21:00:00', 'UTC')
+```
+
+(для KZ ничего не поменяется)
+hour=2026-10-27 19:00:00 (начало часа)  
+country=KZ  
+events_sum=1  
+short_count=0  
+seconds_sum=25  
+under_20_percent=0  
+seconds_avg=25  
+
+hour=2026-10-27 19:00:00  
+country=RU  
+events_sum=4 + 1 = 5  
+short_count= 2 + 1 = 3  
+seconds_sum=84 + 1 = 85  
+under_20_percent=100 * 3 / 5 = 60  
+seconds_avg= 85 / 5 = 17  
+
+hour=2026-10-27 20:00:00  
+country=RU  
+events_sum=1  
+short_count=1  
+seconds_sum=10  
+under_20_percent=100  
+seconds_avg=10  
+
+**Результат в 4.4 Порция Б**
+
+### 4.4 Порция Б
+
+Показатель исторической группы ДО:  
+
+hour=2026-10-24 12:00:00  
+country=RU  
+events_sum=26478  
+short_count=6655  
+seconds_sum=3659184  
+under_20_percent=25.13  
+seconds_avg=138.2   
+
+![](static/4_4_2_result.png)
+
+> повторите отчёт за 27 октября, 19:00-21:00, и сравните с ручным расчётом;  
+
+![](static/4_4_3_verify.png)  
+
+Ожидаемый отчет совпал с полученным - **расхождений нет**  
+
+
+> повторите отчёт по исторической группе RU, 24 октября, 12:00;
+
+![](static/4_4_4_verify.png)   
+
+Ожидаемый отчет совпал с полученным - **расхождений нет**  
+
+> подтвердите изменение её показателей на +1 событие, +1 событие с played_seconds < 20, +7 секунд;
+
+По результату видим, что в исторической группе событие учтено, расхождений нет  
+26478 + 1 = 26479;  
+6655 + 1 = 6656;  
+3659184 + 7 = 3659191;  
+
+![](static/4_4_4_verify.png)  
+
+> выполните общий контроль: ожидается 0 строк расхождений;
+
+Общий контроль, **расхождений нет**  
+
+![](static/4_4_5_verify.png)    
+
+
+> повторите count() источника: ожидается N + 8  
+
+Выполняем count() и получаем 10_000_008 - **расхождений нет**  
+
+![](static/4_4_6_verify.png)    
+
+### 4.5 Ответы на вопросы  
+> Какие данные обработало MV при порции Б? Почему изменился итог старого часа? Зачем понадобилось отдельное заполнение истории?  
+
+В порции Б MV обработало все 3 строки, попавшие в три группы: 27.10 19:00 RU, 27.10 20:00 RU и 24.10 12:00 RU.
+
+Итог старого часа изменился, потому что MV группирует события по времени toStartOfHour(ended_at), а не по моменту вставки.
+
+Отдельное заполнение истории понадобилось, так как инкрементальный MV обрабатывает только новые вставки после создания, а все 10 миллионов строк были вставлены в источник hw_mv_events до создания инкрементального MV.
+
+> Почему при чтении target используются sum и GROUP BY, даже если вставка завершилась успешно?
+
+SummingMergeTree сливает строки с одинаковым ключом (hour, country) только в фоне. На момент выполнения запроса мы не можем гарантировать, что это слияние произошло, поэтому необходимо использовать sum + GROUP BY  
+
+Так, например, строки от А и Б лежат разными физическими строками до фонового слияния.
+
+> Только для группы RU, 27 октября, 19:00 сравните правильную итоговую долю и среднюю длительность с обычным средним процентов и средних двух порций. Покажите расчёт. Из порции Б в эту группу входит одно событие.
+
+```
+(A)
+    ('2026-10-27 19:01:00', 'RU', 5),
+    ('2026-10-27 19:02:00', 'RU', 19),
+    ('2026-10-27 19:03:00', 'RU', 20),
+    ('2026-10-27 19:04:00', 'RU', 40),
+
+    +
+
+(Б)
+    ('2026-10-27 19:00:00', 'RU', 1),
+```
+
+(A)  
+hour=2026-10-27 19:00:00  
+country=RU  
+events_sum=4  
+short_count=2  
+seconds_sum=84  
+under_20_percent=50  
+seconds_avg=21  
+
+Правильная итоговая доля:
+Делаем пересчет events_sum, short_count, seconds_sum и по ним считаем агрегаты  
+under_20_percent=100 * 3 / 5 = 60  
+seconds_avg= 85 / 5 = 17   
+
+Обычное среднее:  
+Используем расчет по А + событие из порции Б
+
+under_20_percent = (50 + 100) / 2 = 75  
+seconds_avg = (21 + 1) / 2 = 11 
+
+
+Результаты ожидаемо расходятся, проценты и средние нельзя усреднять, складывать нужно числители и знаменатели
+
+> Можно ли гарантированно пересчитать долю с новым порогом played_seconds < 10 для произвольной истории, используя только target, без исходных событий и известных контрольных длительностей? Объясните, какой информации достаточно или не хватает. Реализовывать новый отчёт не требуется. 
+
+Нет, гарантированно пересчитать долю <10 сек не получится, так как через агрегаты `events`, `events_under_20` и `total_seconds` не получится выразить агрегат `events_under_10`.  
+
+Для пересчёта с новым порогом нужна информация о распределении длительностей. Так, например, при проектировании таблицы мы заранее могли заложить агрегаты `events_under_10`, `events_from_10_under_20` и т. д.
