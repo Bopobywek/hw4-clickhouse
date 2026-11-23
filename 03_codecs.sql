@@ -1,5 +1,7 @@
 DROP TABLE IF EXISTS takt.hw_codec_mixed;
+
 DROP TABLE IF EXISTS takt.hw_codec_ordered;
+
 CREATE TABLE takt.hw_codec_ordered
 (
  event_no UInt64,
@@ -14,6 +16,7 @@ SETTINGS
  index_granularity_bytes = 0,
  min_bytes_for_wide_part = 0,
  min_rows_for_wide_part = 0;
+
 CREATE TABLE takt.hw_codec_mixed
 AS takt.hw_codec_ordered
 ENGINE = MergeTree
@@ -23,6 +26,7 @@ SETTINGS
  index_granularity_bytes = 0,
  min_bytes_for_wide_part = 0,
  min_rows_for_wide_part = 0;
+
 INSERT INTO takt.hw_codec_ordered
 SELECT
  number,
@@ -31,9 +35,12 @@ SELECT
  event_time,
  event_time
 FROM numbers(500000);
+
 INSERT INTO takt.hw_codec_mixed
 SELECT * FROM takt.hw_codec_ordered;
+
 OPTIMIZE TABLE takt.hw_codec_ordered FINAL;
+
 OPTIMIZE TABLE takt.hw_codec_mixed FINAL;
 
 WITH toDateTime('2026-10-20 00:00:00', 'UTC') AS base
@@ -71,3 +78,45 @@ WHERE database = 'takt'
  AND table IN ('hw_codec_ordered', 'hw_codec_mixed')
 GROUP BY table, part_type
 ORDER BY table;
+
+
+SELECT
+    event_no,
+    t_zstd,
+    toInt64(toUnixTimestamp(t_zstd))
+      - toInt64(toUnixTimestamp(
+          toDateTime('2026-10-20 00:00:00', 'UTC')
+        )) AS seconds_from_start
+FROM takt.hw_codec_mixed
+ORDER BY cityHash64(event_no), event_no
+LIMIT 6;
+
+
+SELECT
+    event_no,
+    t_zstd,
+    toInt64(toUnixTimestamp(t_zstd))
+      - toInt64(toUnixTimestamp(
+          toDateTime('2026-10-20 00:00:00', 'UTC')
+        )) AS seconds_from_start
+FROM takt.hw_codec_ordered
+ORDER BY event_no
+LIMIT 6;
+
+SELECT
+    table,
+    column,
+    sum(column_data_uncompressed_bytes) AS uncompressed_bytes,
+    sum(column_data_compressed_bytes) AS compressed_bytes,
+     round(
+        sum(column_data_uncompressed_bytes)
+        / nullIf(sum(column_data_compressed_bytes), 0),
+        2
+    ) AS compression_ratio
+FROM system.parts_columns
+WHERE database = 'takt'
+  AND active
+  AND table IN ('hw_codec_ordered', 'hw_codec_mixed')
+  AND column IN ('t_zstd', 't_delta', 't_double_delta')
+GROUP BY table, column
+ORDER BY table, column;
